@@ -1,0 +1,25 @@
+{
+  "name": "opencode-agent-team",
+  "version": "1.0.0",
+  "description": "Dynamic agent team plugin for OpenCode - plan agent analyzes tasks and builds specialized subagent teams on-the-fly",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "latest",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "agent-team",
+    "dynamic-agents"
+  ],
+  "license": "MIT"
+}
