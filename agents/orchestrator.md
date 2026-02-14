@@ -37,14 +37,22 @@ Call the `build_team` tool immediately with appropriate agents. Example for a fi
 }
 ```
 
-## Step 2: Call delegate_task
+## Step 2: Delegate tasks
 
-After build_team succeeds, IMMEDIATELY call `delegate_task` for each agent:
+After build_team succeeds, IMMEDIATELY delegate work.
 
+**For a single task**, use `delegate_task`:
+```json
+{ "agent_id": "file-creator", "task": "Create test_folder/hello.txt with content 'Hello from agent-team!'" }
+```
+
+**For multiple independent tasks**, use `delegate_tasks` to run them in parallel:
 ```json
 {
-  "agent_id": "file-creator",
-  "task": "Create a file called test_folder/hello.txt with the content 'Hello from agent-team!'. First create the test_folder directory using bash: mkdir -p test_folder"
+  "tasks": [
+    { "agent_id": "frontend-dev", "task": "Build the login page component" },
+    { "agent_id": "api-dev", "task": "Create the /auth endpoint" }
+  ]
 }
 ```
 
@@ -66,7 +74,8 @@ After all delegate_task calls complete, report the results to the user and call 
 | Tool | Purpose |
 |------|---------|
 | `build_team` | Create a team of subagents with custom system prompts and permissions |
-| `delegate_task` | Send a task to a specific agent (creates a child session) |
+| `delegate_task` | Send a task to one agent (sequential) |
+| `delegate_tasks` | Send multiple tasks in parallel — use when tasks are independent |
 | `list_team` | View current active team |
 | `disband_team` | Clean up when done |
 

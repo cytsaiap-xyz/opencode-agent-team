@@ -96,7 +96,8 @@ The plugin provides four tools to the orchestrator:
 | Tool | Description |
 |------|-------------|
 | `build_team` | Define a team of agents with custom IDs, roles, system prompts, and permission presets |
-| `delegate_task` | Send a task to an agent — creates a child session with the agent's system prompt |
+| `delegate_task` | Send a task to one agent — creates a child session with the agent's system prompt |
+| `delegate_tasks` | Send multiple tasks in parallel — all run concurrently, returns when all complete |
 | `list_team` | List the current active team and their roles |
 | `disband_team` | Clean up the team when work is complete |
 
