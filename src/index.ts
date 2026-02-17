@@ -57,9 +57,23 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
     });
     await teamManager.loadState();
 
+    // Track the orchestrator's session ID for linking child sessions
+    let parentSessionId: string | undefined;
+
     console.log("[agent-team] Plugin initialized — orchestrator ready");
 
     return {
+        event: async ({ event }) => {
+            if (event.type === "session.created") {
+                const sessionId = (event as any).properties?.info?.id;
+                // Only capture the first session as parent (the orchestrator)
+                if (sessionId && !parentSessionId) {
+                    parentSessionId = sessionId;
+                    console.log(`[agent-team] Parent session: ${sessionId}`);
+                }
+            }
+        },
+
         tool: {
             build_team: tool({
                 description:
@@ -148,9 +162,12 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                     try {
                         const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
 
-                        // Create an independent worker session (not a child of the parent)
+                        // Create a worker session linked to the orchestrator for Ctrl+X navigation
                         const sessionResult = await client.session.create({
-                            body: { title: `[${agent.name}] ${agent.role}` }
+                            body: {
+                                title: `[${agent.name}] ${agent.role}`,
+                                ...(parentSessionId ? { parentID: parentSessionId } : {})
+                            }
                         });
                         const sessionId = (sessionResult.data as any)?.id;
                         if (!sessionId) {
@@ -214,7 +231,10 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                             const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`;
 
                             const sessionResult = await client.session.create({
-                                body: { title: `[${agent.name}] ${agent.role}` }
+                                body: {
+                                    title: `[${agent.name}] ${agent.role}`,
+                                    ...(parentSessionId ? { parentID: parentSessionId } : {})
+                                }
                             });
                             const sessionId = (sessionResult.data as any)?.id;
                             if (!sessionId) {
