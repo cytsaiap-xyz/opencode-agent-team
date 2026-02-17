@@ -140,30 +140,28 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         return `No parent session found. Cannot delegate.`;
                     }
 
-                    try {
-                        const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
+                    const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
 
-                        // Fire-and-forget: dispatch subtask to parent session.
-                        // Do NOT poll — polling from within the parent session's tool
-                        // execution deadlocks when the child finishes and reports back.
-                        await client.session.promptAsync({
-                            path: { id: parentSessionId },
-                            body: {
-                                noReply: true,
-                                parts: [{
-                                    type: "subtask" as const,
-                                    prompt: fullPrompt,
-                                    description: `[${agent.name}] ${agent.role}`,
-                                    agent: "worker"
-                                }]
-                            }
-                        });
-                        console.log(`[agent-team] Subtask dispatched for agent ${args.agent_id} on session ${parentSessionId}`);
+                    // Do NOT await — the parent session is currently executing this tool,
+                    // so it can't accept a new prompt until the tool returns.
+                    // Awaiting would deadlock. Fire and let it queue.
+                    client.session.promptAsync({
+                        path: { id: parentSessionId },
+                        body: {
+                            noReply: true,
+                            parts: [{
+                                type: "subtask" as const,
+                                prompt: fullPrompt,
+                                description: `[${agent.name}] ${agent.role}`,
+                                agent: "worker"
+                            }]
+                        }
+                    }).catch(err => {
+                        console.error(`[agent-team] Dispatch failed for ${args.agent_id}: ${err}`);
+                    });
 
-                        return `[Agent ${args.agent_id}] Subtask dispatched. Running in background.`;
-                    } catch (error) {
-                        return `Delegation to ${args.agent_id} failed: ${error instanceof Error ? error.message : String(error)}`;
-                    }
+                    console.log(`[agent-team] Subtask queued for agent ${args.agent_id}`);
+                    return `[Agent ${args.agent_id}] Subtask dispatched. Running in background.`;
                 }
             }),
 
@@ -193,35 +191,31 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         return `No parent session found. Cannot delegate.`;
                     }
 
-                    try {
-                        // Dispatch each subtask as a separate promptAsync call
-                        // so they run as truly independent child sessions.
-                        // Do NOT poll — polling from within the parent session's
-                        // tool execution deadlocks when children finish.
-                        const dispatched: string[] = [];
+                    // Do NOT await any of these — the parent session can't accept
+                    // prompts while this tool is executing. Fire all and let them queue.
+                    const dispatched: string[] = [];
 
-                        for (const t of args.tasks) {
-                            const agent = teamManager.getAgent(t.agent_id)!;
-                            await client.session.promptAsync({
-                                path: { id: parentSessionId },
-                                body: {
-                                    noReply: true,
-                                    parts: [{
-                                        type: "subtask" as const,
-                                        prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
-                                        description: `[${agent.name}] ${agent.role}`,
-                                        agent: "worker"
-                                    }]
-                                }
-                            });
-                            dispatched.push(t.agent_id);
-                            console.log(`[agent-team] Subtask dispatched for agent ${t.agent_id}`);
-                        }
-
-                        return `Parallel delegation: ${dispatched.length} subtasks dispatched (${dispatched.join(", ")}). All running in background.`;
-                    } catch (error) {
-                        return `Failed to launch tasks: ${error instanceof Error ? error.message : String(error)}`;
+                    for (const t of args.tasks) {
+                        const agent = teamManager.getAgent(t.agent_id)!;
+                        client.session.promptAsync({
+                            path: { id: parentSessionId },
+                            body: {
+                                noReply: true,
+                                parts: [{
+                                    type: "subtask" as const,
+                                    prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
+                                    description: `[${agent.name}] ${agent.role}`,
+                                    agent: "worker"
+                                }]
+                            }
+                        }).catch(err => {
+                            console.error(`[agent-team] Dispatch failed for ${t.agent_id}: ${err}`);
+                        });
+                        dispatched.push(t.agent_id);
                     }
+
+                    console.log(`[agent-team] ${dispatched.length} subtasks queued`);
+                    return `Parallel delegation: ${dispatched.length} subtasks dispatched (${dispatched.join(", ")}). All running in background.`;
                 }
             }),
 
