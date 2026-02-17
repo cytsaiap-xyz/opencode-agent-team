@@ -13,12 +13,35 @@ const DEFAULT_CONFIG = {
     }
 } as const;
 
+/** Poll a session until it becomes idle or timeout */
+async function waitForSession(
+    client: any,
+    sessionId: string,
+    timeoutMs: number = 120_000
+): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+            const statusResult = await client.session.status({});
+            const statuses = statusResult.data as any;
+            const status = statuses?.[sessionId];
+            if (!status || status.type === "idle") {
+                return true; // completed
+            }
+        } catch {
+            // status check failed, keep polling
+        }
+    }
+    return false; // timed out
+}
+
 /**
  * Agent Team Plugin for OpenCode
  *
  * The orchestrator agent designs a team, build_team stores agent specs,
- * and delegate_task creates child sessions via the SDK with the agent's
- * system prompt and tool permissions.
+ * and delegate_task creates independent worker sessions via the SDK
+ * with the agent's system prompt and tool permissions.
  */
 export const AgentTeamPlugin: Plugin = async (ctx) => {
     const { directory, client } = ctx;
@@ -34,23 +57,9 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
     });
     await teamManager.loadState();
 
-    // Track the orchestrator's session ID for subtask linking
-    let parentSessionId: string | undefined;
-
     console.log("[agent-team] Plugin initialized — orchestrator ready");
 
     return {
-        event: async ({ event }) => {
-            if (event.type === "session.created") {
-                const sessionId = (event as any).properties?.info?.id;
-                // Only capture the first session as parent (the orchestrator)
-                if (sessionId && !parentSessionId) {
-                    parentSessionId = sessionId;
-                    console.log(`[agent-team] Parent session: ${sessionId}`);
-                }
-            }
-        },
-
         tool: {
             build_team: tool({
                 description:
@@ -120,7 +129,7 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
             delegate_task: tool({
                 description:
                     "Delegate a single task to one subagent. " +
-                    "The subtask runs asynchronously — use Ctrl+X to view progress. " +
+                    "Creates an independent worker session and waits for it to complete. " +
                     "For parallel execution of multiple tasks, use delegate_tasks instead.",
                 args: {
                     agent_id: tool.schema
@@ -136,40 +145,49 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         return `Agent "${args.agent_id}" not found in active team. Use build_team first.`;
                     }
 
-                    if (!parentSessionId) {
-                        return `No parent session found. Cannot delegate.`;
-                    }
+                    try {
+                        const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
 
-                    const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
-
-                    // Do NOT await — the parent session is currently executing this tool,
-                    // so it can't accept a new prompt until the tool returns.
-                    // Awaiting would deadlock. Fire and let it queue.
-                    client.session.promptAsync({
-                        path: { id: parentSessionId },
-                        body: {
-                            noReply: true,
-                            parts: [{
-                                type: "subtask" as const,
-                                prompt: fullPrompt,
-                                description: `[${agent.name}] ${agent.role}`,
-                                agent: "worker"
-                            }]
+                        // Create an independent worker session (not a child of the parent)
+                        const sessionResult = await client.session.create({
+                            body: { title: `[${agent.name}] ${agent.role}` }
+                        });
+                        const sessionId = (sessionResult.data as any)?.id;
+                        if (!sessionId) {
+                            return `Failed to create worker session for ${args.agent_id}`;
                         }
-                    }).catch(err => {
-                        console.error(`[agent-team] Dispatch failed for ${args.agent_id}: ${err}`);
-                    });
+                        console.log(`[agent-team] Worker session ${sessionId} created for ${args.agent_id}`);
 
-                    console.log(`[agent-team] Subtask queued for agent ${args.agent_id}`);
-                    return `[Agent ${args.agent_id}] Subtask dispatched. Running in background.`;
+                        // Send the task to the worker session
+                        await client.session.promptAsync({
+                            path: { id: sessionId },
+                            body: {
+                                agent: "worker",
+                                system: fullPrompt,
+                                parts: [{
+                                    type: "text" as const,
+                                    text: args.task
+                                }]
+                            }
+                        });
+
+                        // Poll the WORKER session (not the parent) — no deadlock
+                        const completed = await waitForSession(client, sessionId, 120_000);
+
+                        if (completed) {
+                            return `[Agent ${args.agent_id}] Task completed successfully.`;
+                        }
+                        return `[Agent ${args.agent_id}] Task may still be running (timeout after 120s).`;
+                    } catch (error) {
+                        return `Delegation to ${args.agent_id} failed: ${error instanceof Error ? error.message : String(error)}`;
+                    }
                 }
             }),
 
             delegate_tasks: tool({
                 description:
                     "Delegate multiple tasks in parallel. " +
-                    "Each subtask launches as a separate child session. " +
-                    "Returns immediately — use Ctrl+X to view progress.",
+                    "Creates independent worker sessions for each task and waits for all to complete.",
                 args: {
                     tasks: tool.schema
                         .array(
@@ -187,35 +205,76 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         }
                     }
 
-                    if (!parentSessionId) {
-                        return `No parent session found. Cannot delegate.`;
-                    }
+                    try {
+                        // Step 1: Create all worker sessions and dispatch prompts
+                        const workers: { agentId: string; sessionId: string }[] = [];
 
-                    // Do NOT await any of these — the parent session can't accept
-                    // prompts while this tool is executing. Fire all and let them queue.
-                    const dispatched: string[] = [];
+                        for (const t of args.tasks) {
+                            const agent = teamManager.getAgent(t.agent_id)!;
+                            const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`;
 
-                    for (const t of args.tasks) {
-                        const agent = teamManager.getAgent(t.agent_id)!;
-                        client.session.promptAsync({
-                            path: { id: parentSessionId },
-                            body: {
-                                noReply: true,
-                                parts: [{
-                                    type: "subtask" as const,
-                                    prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
-                                    description: `[${agent.name}] ${agent.role}`,
-                                    agent: "worker"
-                                }]
+                            const sessionResult = await client.session.create({
+                                body: { title: `[${agent.name}] ${agent.role}` }
+                            });
+                            const sessionId = (sessionResult.data as any)?.id;
+                            if (!sessionId) {
+                                console.error(`[agent-team] Failed to create session for ${t.agent_id}`);
+                                continue;
                             }
-                        }).catch(err => {
-                            console.error(`[agent-team] Dispatch failed for ${t.agent_id}: ${err}`);
-                        });
-                        dispatched.push(t.agent_id);
-                    }
 
-                    console.log(`[agent-team] ${dispatched.length} subtasks queued`);
-                    return `Parallel delegation: ${dispatched.length} subtasks dispatched (${dispatched.join(", ")}). All running in background.`;
+                            await client.session.promptAsync({
+                                path: { id: sessionId },
+                                body: {
+                                    agent: "worker",
+                                    system: fullPrompt,
+                                    parts: [{
+                                        type: "text" as const,
+                                        text: t.task
+                                    }]
+                                }
+                            });
+
+                            workers.push({ agentId: t.agent_id, sessionId });
+                            console.log(`[agent-team] Worker session ${sessionId} created for ${t.agent_id}`);
+                        }
+
+                        if (workers.length === 0) {
+                            return "Failed to create any worker sessions.";
+                        }
+
+                        // Step 2: Poll ALL worker sessions until all idle (or timeout)
+                        const start = Date.now();
+                        const timeoutMs = 180_000; // 3 minutes for parallel
+                        const results: string[] = [];
+
+                        while (Date.now() - start < timeoutMs) {
+                            await new Promise(r => setTimeout(r, 1500));
+                            try {
+                                const statusResult = await client.session.status({});
+                                const statuses = statusResult.data as any;
+
+                                const allDone = workers.every(w => {
+                                    const s = statuses?.[w.sessionId];
+                                    return !s || s.type === "idle";
+                                });
+
+                                if (allDone) break;
+                            } catch {
+                                // status check failed, keep polling
+                            }
+                        }
+
+                        for (const w of workers) {
+                            results.push(`  - ${w.agentId}: completed`);
+                        }
+
+                        return [
+                            `Parallel delegation: ${workers.length} tasks completed.`,
+                            ...results
+                        ].join("\n");
+                    } catch (error) {
+                        return `Failed to launch tasks: ${error instanceof Error ? error.message : String(error)}`;
+                    }
                 }
             }),
 
