@@ -34,12 +34,21 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
     });
     await teamManager.loadState();
 
+    // Track current parent session ID for child session linking
+    let parentSessionId: string | undefined;
+    const childSessionIds = new Set<string>();
+
     console.log("[agent-team] Plugin initialized — orchestrator ready");
 
     return {
         event: async ({ event }) => {
             if (event.type === "session.created") {
-                console.log("[agent-team] New session — dynamic team builder active");
+                const sessionId = (event as any).properties?.info?.id;
+                // Only track as parent if it's not a child session we created
+                if (sessionId && !childSessionIds.has(sessionId)) {
+                    parentSessionId = sessionId;
+                    console.log(`[agent-team] Parent session: ${sessionId}`);
+                }
             }
         },
 
@@ -128,9 +137,15 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                     }
 
                     try {
-                        const createResult = await client.session.create({});
+                        const createResult = await client.session.create({
+                            body: {
+                                ...(parentSessionId ? { parentID: parentSessionId } : {}),
+                                title: `[${agent.name}] ${args.task.substring(0, 50)}`
+                            }
+                        });
                         const sessionId = (createResult.data as any).id;
-                        console.log(`[agent-team] Created session ${sessionId} for agent ${args.agent_id}`);
+                        childSessionIds.add(sessionId);
+                        console.log(`[agent-team] Created child session ${sessionId} (parent: ${parentSessionId}) for agent ${args.agent_id}`);
 
                         await client.session.promptAsync({
                             path: { id: sessionId },
@@ -184,9 +199,15 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                     const sessions: { agentId: string; sessionId: string }[] = [];
                     const launches = args.tasks.map(async (t) => {
                         const agent = teamManager.getAgent(t.agent_id)!;
-                        const createResult = await client.session.create({});
+                        const createResult = await client.session.create({
+                            body: {
+                                ...(parentSessionId ? { parentID: parentSessionId } : {}),
+                                title: `[${agent.name}] ${t.task.substring(0, 50)}`
+                            }
+                        });
                         const sessionId = (createResult.data as any).id;
-                        console.log(`[agent-team] Created session ${sessionId} for agent ${t.agent_id}`);
+                        childSessionIds.add(sessionId);
+                        console.log(`[agent-team] Created child session ${sessionId} (parent: ${parentSessionId}) for agent ${t.agent_id}`);
 
                         await client.session.promptAsync({
                             path: { id: sessionId },
