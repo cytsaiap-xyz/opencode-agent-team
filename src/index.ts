@@ -120,6 +120,7 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
             delegate_task: tool({
                 description:
                     "Delegate a single task to one subagent. " +
+                    "The subtask runs asynchronously — use Ctrl+X to view progress. " +
                     "For parallel execution of multiple tasks, use delegate_tasks instead.",
                 args: {
                     agent_id: tool.schema
@@ -142,7 +143,9 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                     try {
                         const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
 
-                        // Send subtask part to parent session — OpenCode creates a native child session
+                        // Fire-and-forget: dispatch subtask to parent session.
+                        // Do NOT poll — polling from within the parent session's tool
+                        // execution deadlocks when the child finishes and reports back.
                         await client.session.promptAsync({
                             path: { id: parentSessionId },
                             body: {
@@ -157,18 +160,7 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         });
                         console.log(`[agent-team] Subtask dispatched for agent ${args.agent_id} on session ${parentSessionId}`);
 
-                        // Poll parent session until subtask completes
-                        for (let i = 0; i < 15; i++) {
-                            await new Promise(resolve => setTimeout(resolve, 2000));
-                            const statusResult = await client.session.status({});
-                            const statuses = statusResult.data as any;
-                            const status = statuses?.[parentSessionId];
-                            if (!status || status.type === "idle") {
-                                return `[Agent ${args.agent_id}] Task completed.`;
-                            }
-                        }
-
-                        return `[Agent ${args.agent_id}] Task dispatched, may still be running.`;
+                        return `[Agent ${args.agent_id}] Subtask dispatched. Running in background.`;
                     } catch (error) {
                         return `Delegation to ${args.agent_id} failed: ${error instanceof Error ? error.message : String(error)}`;
                     }
@@ -178,7 +170,8 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
             delegate_tasks: tool({
                 description:
                     "Delegate multiple tasks in parallel. " +
-                    "All tasks start concurrently and the tool returns when all complete (or timeout).",
+                    "Each subtask launches as a separate child session. " +
+                    "Returns immediately — use Ctrl+X to view progress.",
                 args: {
                     tasks: tool.schema
                         .array(
@@ -201,39 +194,31 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                     }
 
                     try {
-                        // Send all subtask parts at once to parent session
-                        const subtaskParts = args.tasks.map(t => {
+                        // Dispatch each subtask as a separate promptAsync call
+                        // so they run as truly independent child sessions.
+                        // Do NOT poll — polling from within the parent session's
+                        // tool execution deadlocks when children finish.
+                        const dispatched: string[] = [];
+
+                        for (const t of args.tasks) {
                             const agent = teamManager.getAgent(t.agent_id)!;
-                            return {
-                                type: "subtask" as const,
-                                prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
-                                description: `[${agent.name}] ${agent.role}`,
-                                agent: "worker"
-                            };
-                        });
-
-                        await client.session.promptAsync({
-                            path: { id: parentSessionId },
-                            body: {
-                                noReply: true,
-                                parts: subtaskParts
-                            }
-                        });
-
-                        console.log(`[agent-team] ${subtaskParts.length} subtasks dispatched on session ${parentSessionId}`);
-
-                        // Poll until parent session is idle (all subtasks done)
-                        for (let i = 0; i < 30; i++) {
-                            await new Promise(resolve => setTimeout(resolve, 2000));
-                            const statusResult = await client.session.status({});
-                            const statuses = statusResult.data as any;
-                            const status = statuses?.[parentSessionId];
-                            if (!status || status.type === "idle") {
-                                break;
-                            }
+                            await client.session.promptAsync({
+                                path: { id: parentSessionId },
+                                body: {
+                                    noReply: true,
+                                    parts: [{
+                                        type: "subtask" as const,
+                                        prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
+                                        description: `[${agent.name}] ${agent.role}`,
+                                        agent: "worker"
+                                    }]
+                                }
+                            });
+                            dispatched.push(t.agent_id);
+                            console.log(`[agent-team] Subtask dispatched for agent ${t.agent_id}`);
                         }
 
-                        return `Parallel delegation: ${args.tasks.length} subtasks dispatched.`;
+                        return `Parallel delegation: ${dispatched.length} subtasks dispatched (${dispatched.join(", ")}). All running in background.`;
                     } catch (error) {
                         return `Failed to launch tasks: ${error instanceof Error ? error.message : String(error)}`;
                     }
