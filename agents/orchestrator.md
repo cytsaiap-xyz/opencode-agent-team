@@ -111,9 +111,9 @@ Then after it completes:
 
 **IMPORTANT**: The `task` field in delegate_task should be a SHORT, specific instruction. The detailed instructions are already in the agent's system_prompt. Don't repeat the full spec — just tell the agent what to do in one sentence.
 
-### 3c. Report and clean up
+### 3c. Clean up and report
 
-After all subtasks complete, summarize what was created and call `disband_team`.
+Immediately after delegating, call `disband_team` and tell the user what tasks were dispatched. Do NOT wait for subtasks to finish — they run in the background. The user can monitor progress with Ctrl+X.
 
 ## Rules
 
