@@ -34,9 +34,8 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
     });
     await teamManager.loadState();
 
-    // Track current parent session ID for child session linking
+    // Track the orchestrator's session ID for subtask linking
     let parentSessionId: string | undefined;
-    const childSessionIds = new Set<string>();
 
     console.log("[agent-team] Plugin initialized — orchestrator ready");
 
@@ -44,8 +43,8 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
         event: async ({ event }) => {
             if (event.type === "session.created") {
                 const sessionId = (event as any).properties?.info?.id;
-                // Only track as parent if it's not a child session we created
-                if (sessionId && !childSessionIds.has(sessionId)) {
+                // Only capture the first session as parent (the orchestrator)
+                if (sessionId && !parentSessionId) {
                     parentSessionId = sessionId;
                     console.log(`[agent-team] Parent session: ${sessionId}`);
                 }
@@ -136,31 +135,34 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         return `Agent "${args.agent_id}" not found in active team. Use build_team first.`;
                     }
 
+                    if (!parentSessionId) {
+                        return `No parent session found. Cannot delegate.`;
+                    }
+
                     try {
-                        const createResult = await client.session.create({
-                            body: {
-                                ...(parentSessionId ? { parentID: parentSessionId } : {}),
-                                title: `[${agent.name}] ${args.task.substring(0, 50)}`
-                            }
-                        });
-                        const sessionId = (createResult.data as any).id;
-                        childSessionIds.add(sessionId);
-                        console.log(`[agent-team] Created child session ${sessionId} (parent: ${parentSessionId}) for agent ${args.agent_id}`);
+                        const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
 
+                        // Send subtask part to parent session — OpenCode creates a native child session
                         await client.session.promptAsync({
-                            path: { id: sessionId },
+                            path: { id: parentSessionId },
                             body: {
-                                agent: "worker",
-                                system: `# ${agent.name}\n\n${agent.system_prompt}`,
-                                parts: [{ type: "text", text: args.task }]
+                                noReply: true,
+                                parts: [{
+                                    type: "subtask" as const,
+                                    prompt: fullPrompt,
+                                    description: `[${agent.name}] ${agent.role}`,
+                                    agent: "worker"
+                                }]
                             }
                         });
+                        console.log(`[agent-team] Subtask dispatched for agent ${args.agent_id} on session ${parentSessionId}`);
 
+                        // Poll parent session until subtask completes
                         for (let i = 0; i < 15; i++) {
                             await new Promise(resolve => setTimeout(resolve, 2000));
                             const statusResult = await client.session.status({});
                             const statuses = statusResult.data as any;
-                            const status = statuses?.[sessionId];
+                            const status = statuses?.[parentSessionId];
                             if (!status || status.type === "idle") {
                                 return `[Agent ${args.agent_id}] Task completed.`;
                             }
@@ -188,71 +190,53 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                         .describe("Array of {agent_id, task} pairs to run in parallel")
                 },
                 async execute(args) {
-                    // Validate all agents exist
                     for (const t of args.tasks) {
                         if (!teamManager.getAgent(t.agent_id)) {
                             return `Agent "${t.agent_id}" not found. Use build_team first.`;
                         }
                     }
 
-                    // Launch all sessions concurrently
-                    const sessions: { agentId: string; sessionId: string }[] = [];
-                    const launches = args.tasks.map(async (t) => {
-                        const agent = teamManager.getAgent(t.agent_id)!;
-                        const createResult = await client.session.create({
-                            body: {
-                                ...(parentSessionId ? { parentID: parentSessionId } : {}),
-                                title: `[${agent.name}] ${t.task.substring(0, 50)}`
-                            }
-                        });
-                        const sessionId = (createResult.data as any).id;
-                        childSessionIds.add(sessionId);
-                        console.log(`[agent-team] Created child session ${sessionId} (parent: ${parentSessionId}) for agent ${t.agent_id}`);
-
-                        await client.session.promptAsync({
-                            path: { id: sessionId },
-                            body: {
-                                agent: "worker",
-                                system: `# ${agent.name}\n\n${agent.system_prompt}`,
-                                parts: [{ type: "text", text: t.task }]
-                            }
-                        });
-
-                        sessions.push({ agentId: t.agent_id, sessionId });
-                    });
+                    if (!parentSessionId) {
+                        return `No parent session found. Cannot delegate.`;
+                    }
 
                     try {
-                        await Promise.all(launches);
+                        // Send all subtask parts at once to parent session
+                        const subtaskParts = args.tasks.map(t => {
+                            const agent = teamManager.getAgent(t.agent_id)!;
+                            return {
+                                type: "subtask" as const,
+                                prompt: `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`,
+                                description: `[${agent.name}] ${agent.role}`,
+                                agent: "worker"
+                            };
+                        });
+
+                        await client.session.promptAsync({
+                            path: { id: parentSessionId },
+                            body: {
+                                noReply: true,
+                                parts: subtaskParts
+                            }
+                        });
+
+                        console.log(`[agent-team] ${subtaskParts.length} subtasks dispatched on session ${parentSessionId}`);
+
+                        // Poll until parent session is idle (all subtasks done)
+                        for (let i = 0; i < 30; i++) {
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            const statusResult = await client.session.status({});
+                            const statuses = statusResult.data as any;
+                            const status = statuses?.[parentSessionId];
+                            if (!status || status.type === "idle") {
+                                break;
+                            }
+                        }
+
+                        return `Parallel delegation: ${args.tasks.length} subtasks dispatched.`;
                     } catch (error) {
                         return `Failed to launch tasks: ${error instanceof Error ? error.message : String(error)}`;
                     }
-
-                    console.log(`[agent-team] ${sessions.length} tasks dispatched in parallel, polling...`);
-
-                    // Poll all sessions until all idle (max 60 seconds)
-                    const pending = new Set(sessions.map(s => s.sessionId));
-                    for (let i = 0; i < 30 && pending.size > 0; i++) {
-                        await new Promise(resolve => setTimeout(resolve, 2000));
-                        const statusResult = await client.session.status({});
-                        const statuses = statusResult.data as any;
-                        for (const sid of [...pending]) {
-                            const status = statuses?.[sid];
-                            if (!status || status.type === "idle") {
-                                pending.delete(sid);
-                            }
-                        }
-                    }
-
-                    // Build result summary
-                    const results = sessions.map(s => {
-                        const done = !pending.has(s.sessionId);
-                        return `  - ${s.agentId}: ${done ? "completed" : "still running"}`;
-                    });
-
-                    return [
-                        `Parallel delegation results (${sessions.length} tasks):`,
-                        ...results
-                    ].join("\n");
                 }
             }),
 
