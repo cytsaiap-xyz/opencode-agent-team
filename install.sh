@@ -27,7 +27,8 @@ echo "  Created .opencode/plugins/agent-team.ts"
 if [ ! -f "$OPENCODE_DIR/agent-team.json" ]; then
   cat > "$OPENCODE_DIR/agent-team.json" << 'EOF'
 {
-    "enabled": true
+    "enabled": true,
+    "verbose": false
 }
 EOF
   echo "  Created .opencode/agent-team.json (enabled)"
