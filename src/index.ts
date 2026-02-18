@@ -1,8 +1,10 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { join } from "path";
 import { TeamManager } from "./team-manager.js";
-import type { AgentSpec } from "./prompt-builder.js";
+import { buildDelegationPrompt, type AgentSpec } from "./prompt-builder.js";
+import { loadAllSkills, buildSkillContext, type SkillsRegistry } from "./skills-loader.js";
+import { loadAgentTeamConfig } from "./config-loader.js";
+import { loadAgentDefs } from "./agent-defs.js";
 
 const DEFAULT_CONFIG = {
     maxTeamSize: 6,
@@ -13,26 +15,24 @@ const DEFAULT_CONFIG = {
     }
 } as const;
 
-interface PendingSubtask {
-    prompt: string;
-    description: string;
-}
+// Resolve the plugin package root (parent of src/)
+const PLUGIN_DIR = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
-/**
- * Agent Team Plugin for OpenCode
- *
- * Uses a deferred dispatch pattern:
- * 1. delegate_task/delegate_tasks store subtask specs and return immediately
- * 2. When the orchestrator's session becomes idle, the event handler
- *    sends SubtaskPartInput to the parent session
- * 3. OpenCode creates native child sessions (Ctrl+X works)
- * 4. No deadlock because dispatch happens when session is free
- */
+const BUILTIN_AGENTS = ["plan", "build", "general", "explore"] as const;
+
 export const AgentTeamPlugin: Plugin = async (ctx) => {
     const { directory, client } = ctx;
 
-    const agentsDir = join(directory, ".opencode", "agents");
-    const teamManager = new TeamManager(agentsDir, {
+    // Load toggle config and agent definitions
+    const pluginConfig = loadAgentTeamConfig(directory);
+    const agentDefs = loadAgentDefs(PLUGIN_DIR);
+
+    const log = (...args: unknown[]) => { if (pluginConfig.verbose) console.log("[agent-team]", ...args); };
+    const warn = (...args: unknown[]) => { if (pluginConfig.verbose) console.warn("[agent-team]", ...args); };
+
+    log(`Config: enabled=${pluginConfig.enabled}, agents loaded: ${Object.keys(agentDefs).join(", ") || "none"}`);
+
+    const teamManager = new TeamManager({
         maxTeamSize: DEFAULT_CONFIG.maxTeamSize,
         permissionPresets: {
             reader: [...DEFAULT_CONFIG.permissionPresets.reader],
@@ -40,246 +40,404 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
             full: [...DEFAULT_CONFIG.permissionPresets.full]
         }
     });
-    await teamManager.loadState();
+
+    // Load skills from filesystem (no server dependency — safe at init time)
+    let skills: SkillsRegistry = new Map();
+    try {
+        skills = await loadAllSkills(directory);
+        log(`Loaded ${skills.size} skill(s): ${[...skills.keys()].join(", ")}`);
+    } catch (err) {
+        warn(`Could not load skills: ${err}`);
+    }
 
     // Track the orchestrator's session ID
     let parentSessionId: string | undefined;
 
-    // Queue of subtasks waiting to be dispatched when session is idle
-    let pendingSubtasks: PendingSubtask[] = [];
-    let dispatching = false;
+    // Lock to enforce one delegation at a time
+    let delegationInProgress = false;
 
-    console.log("[agent-team] Plugin initialized — orchestrator ready");
+    log("Plugin initialized");
 
-    /** Send all pending subtasks to the parent session */
-    async function dispatchPending() {
-        if (dispatching || pendingSubtasks.length === 0 || !parentSessionId) return;
-        dispatching = true;
 
-        const parts = pendingSubtasks.map(s => ({
-            type: "subtask" as const,
-            prompt: s.prompt,
-            description: s.description,
-            agent: "worker"
-        }));
-        pendingSubtasks = [];
+    /**
+     * Dispatch via SubtaskPartInput (visible in Ctrl+X UI), then discover
+     * the new subtask session, poll until idle, and return results.
+     */
+    async function dispatchSubtask(agentId: string, prompt: string, description: string): Promise<string> {
+        if (!parentSessionId) {
+            return "ERROR: No parent session found. Cannot dispatch subtask.";
+        }
+
+        const POLL_INTERVAL_MS = 3000;
+        const MAX_WAIT_MS = 10 * 60 * 1000; // 10 minutes
 
         try {
+            // 1. Snapshot existing session IDs before dispatch
+            const existingIds = new Set<string>();
+            try {
+                const beforeStatus = await client.session.status({ query: { directory } });
+                if (beforeStatus.data) {
+                    for (const id of Object.keys(beforeStatus.data as Record<string, unknown>)) {
+                        existingIds.add(id);
+                    }
+                }
+            } catch {}
+
+            // 2. Dispatch via SubtaskPartInput — visible in OpenCode UI (Ctrl+X)
             await client.session.promptAsync({
                 path: { id: parentSessionId },
                 body: {
-                    noReply: true,
-                    parts
+                    parts: [{
+                        type: "subtask" as const,
+                        prompt,
+                        description,
+                        agent: agentId
+                    }]
                 }
             });
-            console.log(`[agent-team] ${parts.length} subtask(s) dispatched to parent session`);
+
+            log(`Subtask dispatched: ${description}`);
+
+            // 3. Discover the new subtask session by diffing status
+            let subtaskSessionId: string | undefined;
+            const discoveryStart = Date.now();
+
+            while (Date.now() - discoveryStart < 30000) {
+                await new Promise(r => setTimeout(r, 2000));
+                try {
+                    const statusResult = await client.session.status({ query: { directory } });
+                    if (statusResult.data) {
+                        const statusMap = statusResult.data as Record<string, { type: string }>;
+                        for (const id of Object.keys(statusMap)) {
+                            if (!existingIds.has(id)) {
+                                subtaskSessionId = id;
+                                break;
+                            }
+                        }
+                    }
+                } catch {}
+                if (subtaskSessionId) break;
+            }
+
+            if (!subtaskSessionId) {
+                return `Subtask dispatched: ${description}\nCould not track session for result — use Ctrl+X to monitor.`;
+            }
+
+            log(`Subtask session: ${subtaskSessionId}`);
+
+            // 4. Poll until subtask session is idle
+            const startTime = Date.now();
+            let completed = false;
+
+            while (Date.now() - startTime < MAX_WAIT_MS) {
+                try {
+                    const statusResult = await client.session.status({ query: { directory } });
+                    if (statusResult.data) {
+                        const statusMap = statusResult.data as Record<string, { type: string }>;
+                        const status = statusMap[subtaskSessionId];
+                        if (!status || status.type === "idle") {
+                            completed = true;
+                            break;
+                        }
+                        if (status.type === "retry") {
+                            log(`Session ${subtaskSessionId} retrying...`);
+                        }
+                    }
+                } catch {}
+
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            }
+
+            if (!completed) {
+                return `WARNING: Subtask "${description}" timed out after 10 minutes.`;
+            }
+
+            log(`Subtask completed: ${description}`);
+
+            // 5. Extract result text from subtask messages
+            try {
+                const msgsResult = await client.session.messages({
+                    path: { id: subtaskSessionId },
+                    query: { directory }
+                });
+
+                if (msgsResult.data) {
+                    const messages = msgsResult.data as Array<{ info: unknown; parts: Array<{ type: string; text?: string }> }>;
+                    for (let i = messages.length - 1; i >= 0; i--) {
+                        const parts = messages[i].parts || [];
+                        const textParts = parts
+                            .filter(p => p.type === "text" && p.text)
+                            .map(p => p.text as string);
+
+                        if (textParts.length > 0) {
+                            const text = textParts.join("\n");
+                            const summary = text.length > 3000
+                                ? text.substring(0, 3000) + "\n...(truncated)"
+                                : text;
+                            return `COMPLETED: ${description}\n\n${summary}`;
+                        }
+                    }
+                }
+            } catch (msgErr) {
+                warn(`Could not retrieve messages: ${msgErr}`);
+            }
+
+            return `COMPLETED: ${description}\n(No text output retrieved)`;
         } catch (err) {
-            console.error(`[agent-team] Failed to dispatch subtasks: ${err}`);
-        } finally {
-            dispatching = false;
+            warn(`dispatchSubtask failed: ${err}`);
+            return `ERROR: Subtask "${description}" failed: ${err}`;
         }
     }
 
-    return {
-        event: async ({ event }) => {
-            if (event.type === "session.created") {
-                const sessionId = (event as any).properties?.info?.id;
-                if (sessionId && !parentSessionId) {
-                    parentSessionId = sessionId;
-                    console.log(`[agent-team] Parent session: ${sessionId}`);
+    // Define all tools — only exposed when enabled
+    const allTools = {
+        plan_team: tool({
+            description:
+                "CALL THIS FIRST. Start planning a new agent team. " +
+                "After this, call add_agent for each agent, then finalize_team.",
+            args: {
+                task_summary: tool.schema
+                    .string()
+                    .describe("High-level summary of the overall task")
+            },
+            async execute(args) {
+                try {
+                    teamManager.startTeam(args.task_summary);
+                    return [
+                        `Team planning started for: ${args.task_summary}`,
+                        "",
+                        "Now call add_agent for each specialized agent (minimum 2).",
+                        "Then call finalize_team to lock in the team."
+                    ].join("\n");
+                } catch (error) {
+                    return `Failed to start team: ${error instanceof Error ? error.message : String(error)}`;
                 }
             }
+        }),
 
-            // When the orchestrator's session becomes idle, dispatch pending subtasks
-            if (event.type === "session.idle") {
-                await dispatchPending();
+        add_agent: tool({
+            description:
+                "Add one agent to the team being planned. Call after plan_team. " +
+                "Each call adds one agent. Repeat for each agent needed.",
+            args: {
+                id: tool.schema
+                    .string()
+                    .describe("Unique agent ID in kebab-case (e.g. auth-model-dev)"),
+                role: tool.schema
+                    .string()
+                    .describe("One-line role description"),
+                system_prompt: tool.schema
+                    .string()
+                    .describe("Detailed instructions for the agent: file paths, function signatures, approach, constraints"),
+                skills: tool.schema
+                    .string()
+                    .describe("Comma-separated skill names from Available Skills, or empty string if none needed"),
+                permissions: tool.schema
+                    .string()
+                    .describe("Permission preset: reader, writer, or full")
+            },
+            async execute(args) {
+                try {
+                    const skillsList = args.skills.trim()
+                        ? args.skills.split(",").map(s => s.trim()).filter(Boolean)
+                        : [];
+                    const permsList = args.permissions.split(",").map(s => s.trim()).filter(Boolean);
+
+                    const spec: AgentSpec = {
+                        id: args.id,
+                        name: args.role,
+                        role: args.role,
+                        system_prompt: args.system_prompt,
+                        skills: skillsList,
+                        permissions: permsList
+                    };
+
+                    const { warnings } = teamManager.addAgent(spec);
+                    const pending = teamManager.getPendingAgents();
+
+                    const lines = [
+                        `Agent "${args.id}" added (${args.role}).`,
+                        `Team now has ${pending.length} agent(s): ${pending.map(a => a.id).join(", ")}`,
+                    ];
+
+                    if (pending.length < 2) {
+                        lines.push("Add at least 1 more agent before calling finalize_team.");
+                    } else {
+                        lines.push("You can add more agents or call finalize_team to lock in the team.");
+                    }
+
+                    if (warnings.length > 0) {
+                        lines.push("", "Warnings:", ...warnings.map(w => `  - ${w}`));
+                    }
+
+                    return lines.join("\n");
+                } catch (error) {
+                    return `Failed to add agent: ${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
+        }),
+
+        finalize_team: tool({
+            description:
+                "Finalize the team after adding all agents. Requires 2+ agents. " +
+                "After this, call delegate_task ONE AT A TIME for each agent.",
+            args: {},
+            async execute() {
+                try {
+                    const { team, warnings } = teamManager.finalizeTeam();
+
+                    const agentSummary = team.agents
+                        .map(a => `  - ${a.id}: ${a.role}`)
+                        .join("\n");
+
+                    const lines = [
+                        `Team finalized with ${team.agents.length} agent(s):`,
+                        agentSummary,
+                        "",
+                        `Now call delegate_task for EACH agent ONE AT A TIME.`,
+                        `Each call blocks until that agent finishes. After ALL complete, call disband_team.`
+                    ];
+
+                    if (warnings.length > 0) {
+                        lines.push("", "Warnings:", ...warnings.map(w => `  - ${w}`));
+                    }
+
+                    return lines.join("\n");
+                } catch (error) {
+                    return `Failed to finalize team: ${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
+        }),
+
+        delegate_task: tool({
+            description:
+                "Delegate a task to one subagent and WAIT for it to complete. " +
+                "Returns the result summary. Call once per agent, sequentially.",
+            args: {
+                agent_id: tool.schema
+                    .string()
+                    .describe("ID of the agent to delegate to (from build_team)"),
+                task: tool.schema
+                    .string()
+                    .describe("Short task instruction (detailed spec is in the agent's system_prompt)")
+            },
+            async execute(args) {
+                if (teamManager.isPlanning()) {
+                    return `ERROR: Team is still being planned. Call finalize_team first before delegating.`;
+                }
+                if (!teamManager.getActiveTeam()) {
+                    return `ERROR: No team exists. Call plan_team → add_agent → finalize_team first.`;
+                }
+
+                // Enforce one delegation at a time
+                if (delegationInProgress) {
+                    return `ERROR: Another delegation is already in progress. Wait for it to complete before calling delegate_task again. Call delegate_task only ONCE per message.`;
+                }
+
+                const agent = teamManager.getAgent(args.agent_id);
+                if (!agent) {
+                    return `ERROR: Agent "${args.agent_id}" not found. Available agents: ${teamManager.getActiveTeam()!.agents.map(a => a.id).join(", ")}`;
+                }
+
+                const skillContext = buildSkillContext(skills, agent.skills);
+                const fullPrompt = buildDelegationPrompt(agent, args.task, skillContext);
+
+                // Lock to prevent parallel delegations
+                delegationInProgress = true;
+                try {
+                    // Always dispatch to "worker" agent (the only subagent OpenCode knows at runtime)
+                    // The dynamic agent prompt is injected into the subtask prompt
+                    return await dispatchSubtask(
+                        "worker",
+                        fullPrompt,
+                        `[${agent.name}] ${args.task}`
+                    );
+                } finally {
+                    delegationInProgress = false;
+                }
+            }
+        }),
+
+        list_team: tool({
+            description: "List the current active agent team and their roles",
+            args: {},
+            async execute() {
+                const team = teamManager.getActiveTeam();
+                if (!team) {
+                    return "No active team. Use build_team to create one.";
+                }
+
+                return JSON.stringify(
+                    {
+                        sessionId: team.sessionId,
+                        taskSummary: team.taskSummary,
+                        createdAt: team.createdAt,
+                        agents: team.agents.map(a => ({
+                            id: a.id, role: a.role,
+                            skills: a.skills, permissions: a.permissions
+                        }))
+                    },
+                    null,
+                    2
+                );
+            }
+        }),
+
+        disband_team: tool({
+            description: "Disband the current agent team. Call AFTER all subtasks have completed and results reviewed.",
+            args: {},
+            async execute() {
+                try {
+                    const removed = teamManager.disbandTeam();
+                    return `Team disbanded. Removed ${removed.length} agent(s): ${removed.join(", ")}`;
+                } catch (error) {
+                    return `Failed to disband team: ${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
+        })
+    };
+
+    return {
+        config: async (config) => {
+            if (!pluginConfig.enabled) return;
+
+            // Disable built-in agents
+            config.agent = config.agent ?? {};
+            for (const name of BUILTIN_AGENTS) {
+                config.agent[name] = { ...config.agent[name], disable: true };
+            }
+
+            // Build skills list to inject into orchestrator prompt
+            let skillsSection = "";
+            if (skills.size > 0) {
+                const skillLines = [...skills.values()].map(
+                    s => `- **${s.name}**${s.description ? `: ${s.description}` : ""}`
+                );
+                skillsSection = `\n\n## Available Skills\n\nAssign these to agents via the \`skills\` field in \`add_agent\` (comma-separated). Skill content is automatically injected into the agent's prompt during delegation.\n\n${skillLines.join("\n")}`;
+            }
+
+            // Register agent-team agents (user overrides in opencode.json take precedence)
+            for (const [name, def] of Object.entries(agentDefs)) {
+                const merged = { ...def, ...config.agent[name] };
+                // Append skills list to orchestrator prompt
+                if (name === "orchestrator" && skillsSection && merged.prompt) {
+                    merged.prompt = merged.prompt + skillsSection;
+                }
+                config.agent[name] = merged;
             }
         },
 
-        tool: {
-            build_team: tool({
-                description:
-                    "Create a team of specialized subagents for the current task. " +
-                    "After building, use delegate_task or delegate_tasks to send work to agents.",
-                args: {
-                    task_summary: tool.schema
-                        .string()
-                        .describe("High-level summary of the task"),
-                    agents: tool.schema
-                        .array(
-                            tool.schema.object({
-                                id: tool.schema
-                                    .string()
-                                    .describe("Agent identifier in kebab-case (e.g. frontend-dev)"),
-                                name: tool.schema
-                                    .string()
-                                    .describe("Display name"),
-                                role: tool.schema
-                                    .string()
-                                    .describe("One-line role description"),
-                                system_prompt: tool.schema
-                                    .string()
-                                    .describe("Full system prompt — identity, instructions, constraints"),
-                                skills: tool.schema
-                                    .array(tool.schema.string())
-                                    .describe("Skill tags"),
-                                permissions: tool.schema
-                                    .array(tool.schema.string())
-                                    .describe(
-                                        "Use a preset (reader, writer, full) or explicit tool list"
-                                    )
-                            })
-                        )
-                        .describe("Array of agent specifications")
-                },
-                async execute(args) {
-                    try {
-                        const agentSpecs: AgentSpec[] = args.agents.map((a) => ({
-                            id: a.id,
-                            name: a.name,
-                            role: a.role,
-                            system_prompt: a.system_prompt,
-                            skills: a.skills,
-                            permissions: a.permissions
-                        }));
-
-                        const team = await teamManager.buildTeam(args.task_summary, agentSpecs);
-
-                        const agentSummary = team.agents
-                            .map(a => `  - ${a.id} (${a.name}): ${a.role}`)
-                            .join("\n");
-
-                        return [
-                            `Team "${team.sessionId}" created with ${team.agents.length} agent(s):`,
-                            agentSummary,
-                            "",
-                            `Use delegate_task or delegate_tasks to send work to agents.`,
-                            `Call disband_team when finished.`
-                        ].join("\n");
-                    } catch (error) {
-                        return `Failed to build team: ${error instanceof Error ? error.message : String(error)}`;
-                    }
+        event: async ({ event }) => {
+            if (event.type === "session.created") {
+                const props = (event as { properties?: { info?: { id?: string } } }).properties;
+                if (props?.info?.id && !parentSessionId) {
+                    parentSessionId = props.info.id;
+                    log(`Parent session: ${parentSessionId}`);
                 }
-            }),
+            }
+        },
 
-            delegate_task: tool({
-                description:
-                    "Delegate a single task to one subagent. " +
-                    "The subtask is queued and starts when the session is ready. " +
-                    "Use Ctrl+X to monitor progress. " +
-                    "For parallel execution, use delegate_tasks instead.",
-                args: {
-                    agent_id: tool.schema
-                        .string()
-                        .describe("ID of the agent to delegate to (from build_team)"),
-                    task: tool.schema
-                        .string()
-                        .describe("Detailed task description for the agent to execute")
-                },
-                async execute(args) {
-                    const agent = teamManager.getAgent(args.agent_id);
-                    if (!agent) {
-                        return `Agent "${args.agent_id}" not found in active team. Use build_team first.`;
-                    }
-
-                    if (!parentSessionId) {
-                        return `No parent session found. Cannot delegate.`;
-                    }
-
-                    const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${args.task}`;
-
-                    // Queue the subtask — it will be dispatched when session becomes idle
-                    pendingSubtasks.push({
-                        prompt: fullPrompt,
-                        description: `[${agent.name}] ${agent.role}`
-                    });
-
-                    console.log(`[agent-team] Subtask queued for ${args.agent_id} (pending: ${pendingSubtasks.length})`);
-                    return `[Agent ${args.agent_id}] Task queued. Will start after current turn completes. Use Ctrl+X to monitor.`;
-                }
-            }),
-
-            delegate_tasks: tool({
-                description:
-                    "Delegate multiple tasks in parallel. " +
-                    "All subtasks are queued and start when the session is ready. " +
-                    "Use Ctrl+X to monitor progress.",
-                args: {
-                    tasks: tool.schema
-                        .array(
-                            tool.schema.object({
-                                agent_id: tool.schema.string().describe("Agent ID from build_team"),
-                                task: tool.schema.string().describe("Task description")
-                            })
-                        )
-                        .describe("Array of {agent_id, task} pairs to run in parallel")
-                },
-                async execute(args) {
-                    for (const t of args.tasks) {
-                        if (!teamManager.getAgent(t.agent_id)) {
-                            return `Agent "${t.agent_id}" not found. Use build_team first.`;
-                        }
-                    }
-
-                    if (!parentSessionId) {
-                        return `No parent session found. Cannot delegate.`;
-                    }
-
-                    // Queue all subtasks — dispatched together when session becomes idle
-                    for (const t of args.tasks) {
-                        const agent = teamManager.getAgent(t.agent_id)!;
-                        const fullPrompt = `# Your Role: ${agent.name}\n\n${agent.system_prompt}\n\n# Task\n\n${t.task}`;
-
-                        pendingSubtasks.push({
-                            prompt: fullPrompt,
-                            description: `[${agent.name}] ${agent.role}`
-                        });
-                    }
-
-                    const agentIds = args.tasks.map(t => t.agent_id).join(", ");
-                    console.log(`[agent-team] ${args.tasks.length} subtasks queued (${agentIds})`);
-                    return `${args.tasks.length} tasks queued (${agentIds}). They will start after the current turn completes. Use Ctrl+X to monitor progress.`;
-                }
-            }),
-
-            list_team: tool({
-                description: "List the current active agent team and their roles",
-                args: {},
-                async execute() {
-                    const team = teamManager.getActiveTeam();
-                    if (!team) {
-                        return "No active team. Use build_team to create one.";
-                    }
-
-                    return JSON.stringify(
-                        {
-                            sessionId: team.sessionId,
-                            taskSummary: team.taskSummary,
-                            createdAt: team.createdAt,
-                            agents: team.agents.map(a => ({
-                                id: a.id, name: a.name, role: a.role,
-                                skills: a.skills, permissions: a.permissions
-                            }))
-                        },
-                        null,
-                        2
-                    );
-                }
-            }),
-
-            disband_team: tool({
-                description: "Disband the current agent team and remove agent files.",
-                args: {},
-                async execute() {
-                    try {
-                        const removed = await teamManager.disbandTeam();
-                        return `Team disbanded. Removed ${removed.length} agent(s): ${removed.join(", ")}`;
-                    } catch (error) {
-                        return `Failed to disband team: ${error instanceof Error ? error.message : String(error)}`;
-                    }
-                }
-            })
-        }
+        tool: pluginConfig.enabled ? allTools : {}
     };
 };
 

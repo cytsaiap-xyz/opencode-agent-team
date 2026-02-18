@@ -1,6 +1,13 @@
-import { writeFile, readFile, mkdir, rm, readdir } from "fs/promises";
-import { join } from "path";
-import { buildAgentMarkdown, resolvePermissions, type AgentSpec } from "./prompt-builder.js";
+/**
+ * TeamManager — In-memory team registry.
+ * Tracks active agent team and validates tool permissions.
+ *
+ * Agent definitions are NOT written to disk because OpenCode only loads
+ * agents at startup (no hot-reload). Instead, dynamic agent prompts are
+ * injected into the "worker" subtask at dispatch time.
+ */
+
+import { resolvePermissions, type AgentSpec } from "./prompt-builder.js";
 
 interface TeamState {
     sessionId: string;
@@ -14,89 +21,85 @@ interface TeamManagerConfig {
     permissionPresets: Record<string, string[]>;
 }
 
-/**
- * TeamManager — Writes/removes agent .md files in .opencode/agents/
- * so OpenCode discovers them as subagents with their own permissions.
- * The plan agent then calls them via the native @agent-id mechanism.
- */
 export class TeamManager {
-    private agentsDir: string;
     private config: TeamManagerConfig;
-    private statePath: string;
     private activeTeam: TeamState | null = null;
 
-    constructor(agentsDir: string, config: TeamManagerConfig) {
-        this.agentsDir = agentsDir;
+    // Staging area for incremental team building
+    private pendingTaskSummary: string | null = null;
+    private pendingAgents: AgentSpec[] = [];
+
+    constructor(config: TeamManagerConfig) {
         this.config = config;
-        this.statePath = join(agentsDir, ".agent-team-state.json");
     }
 
-    async loadState(): Promise<void> {
-        try {
-            const raw = await readFile(this.statePath, "utf-8");
-            this.activeTeam = JSON.parse(raw);
-        } catch {
-            this.activeTeam = null;
-        }
-    }
-
-    private async saveState(): Promise<void> {
-        await mkdir(this.agentsDir, { recursive: true });
+    /** Start planning a new team. Clears any existing team and staging area. */
+    startTeam(taskSummary: string): void {
         if (this.activeTeam) {
-            await writeFile(this.statePath, JSON.stringify(this.activeTeam, null, 2), "utf-8");
-        } else {
-            try { await rm(this.statePath, { force: true }); } catch { /* ignore */ }
+            this.disbandTeam();
         }
+        this.pendingTaskSummary = taskSummary;
+        this.pendingAgents = [];
     }
 
-    /**
-     * Build a team: write .md files to .opencode/agents/ for each agent.
-     * Each file defines mode: subagent with its own tools/permissions.
-     */
-    async buildTeam(taskSummary: string, agentSpecs: AgentSpec[]): Promise<TeamState> {
-        if (agentSpecs.length > this.config.maxTeamSize) {
-            throw new Error(`Team size ${agentSpecs.length} exceeds maximum of ${this.config.maxTeamSize}`);
-        }
-        if (agentSpecs.length === 0) {
-            throw new Error("At least one agent spec is required");
-        }
+    /** Whether a team is currently being planned (between startTeam and finalizeTeam). */
+    isPlanning(): boolean {
+        return this.pendingTaskSummary !== null;
+    }
 
-        const ids = agentSpecs.map(a => a.id);
-        if (new Set(ids).size !== ids.length) {
-            throw new Error("Duplicate agent IDs found in team spec");
+    /** Add one agent to the staging area. Returns warnings for unknown tools. */
+    addAgent(spec: AgentSpec): { warnings: string[] } {
+        if (!this.pendingTaskSummary) {
+            throw new Error("No team planning in progress. Call plan_team first.");
         }
 
-        // Disband existing team first
-        if (this.activeTeam) {
-            await this.disbandTeam();
+        if (this.pendingAgents.length >= this.config.maxTeamSize) {
+            throw new Error(`Cannot add more agents — maximum team size is ${this.config.maxTeamSize}`);
         }
 
-        await mkdir(this.agentsDir, { recursive: true });
+        if (this.pendingAgents.some(a => a.id === spec.id)) {
+            throw new Error(`Duplicate agent ID "${spec.id}" — each agent must have a unique ID`);
+        }
 
-        const resolvedSpecs: AgentSpec[] = [];
-        for (const spec of agentSpecs) {
-            const resolved: AgentSpec = {
-                ...spec,
-                permissions: resolvePermissions(spec.permissions, this.config.permissionPresets)
-            };
-            resolvedSpecs.push(resolved);
+        const resolved: AgentSpec = {
+            ...spec,
+            permissions: resolvePermissions(spec.permissions, this.config.permissionPresets)
+        };
 
-            // Write the agent .md file — OpenCode discovers it as a subagent
-            const markdown = buildAgentMarkdown(resolved);
-            const filePath = join(this.agentsDir, `${resolved.id}.md`);
-            await writeFile(filePath, markdown, "utf-8");
-            console.log(`[agent-team] Wrote agent file: ${resolved.id}.md`);
+        this.pendingAgents.push(resolved);
+        return { warnings: [] };
+    }
+
+    /** Get the list of staged agents (before finalize). */
+    getPendingAgents(): AgentSpec[] {
+        return [...this.pendingAgents];
+    }
+
+    /** Finalize the staged agents into an active team. Requires 2+ agents. */
+    finalizeTeam(): { team: TeamState; warnings: string[] } {
+        if (!this.pendingTaskSummary) {
+            throw new Error("No team planning in progress. Call plan_team first.");
+        }
+
+        if (this.pendingAgents.length < 2) {
+            throw new Error(
+                `Team needs at least 2 agents (currently ${this.pendingAgents.length}). ` +
+                "Add more agents with add_agent before calling finalize_team."
+            );
         }
 
         this.activeTeam = {
             sessionId: `team-${Date.now()}`,
-            taskSummary,
-            agents: resolvedSpecs,
+            taskSummary: this.pendingTaskSummary,
+            agents: [...this.pendingAgents],
             createdAt: new Date().toISOString()
         };
 
-        await this.saveState();
-        return this.activeTeam;
+        // Clear staging
+        this.pendingTaskSummary = null;
+        this.pendingAgents = [];
+
+        return { team: this.activeTeam, warnings: [] };
     }
 
     getAgent(agentId: string): AgentSpec | undefined {
@@ -108,26 +111,16 @@ export class TeamManager {
     }
 
     /**
-     * Disband team: remove dynamically-created agent .md files.
-     * Never removes plan.md.
+     * Disband team: clear the in-memory registry.
+     * Returns the list of removed agent IDs.
      */
-    async disbandTeam(): Promise<string[]> {
+    disbandTeam(): string[] {
         if (!this.activeTeam) {
             throw new Error("No active team to disband");
         }
 
-        const removed: string[] = [];
-        for (const agent of this.activeTeam.agents) {
-            const filePath = join(this.agentsDir, `${agent.id}.md`);
-            try {
-                await rm(filePath, { force: true });
-                removed.push(agent.id);
-                console.log(`[agent-team] Removed agent file: ${agent.id}.md`);
-            } catch { /* ignore */ }
-        }
-
+        const removed = this.activeTeam.agents.map(a => a.id);
         this.activeTeam = null;
-        await this.saveState();
         return removed;
     }
 }

@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "latest",
-    "zod": "^3.23.0"
+    "@opencode-ai/sdk": "latest"
   },
   "devDependencies": {
     "@types/bun": "latest",
