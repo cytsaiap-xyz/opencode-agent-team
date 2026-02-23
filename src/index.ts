@@ -5,6 +5,12 @@ import { buildDelegationPrompt, type AgentSpec } from "./prompt-builder.js";
 import { loadAllSkills, buildSkillContext, type SkillsRegistry } from "./skills-loader.js";
 import { loadAgentTeamConfig } from "./config-loader.js";
 import { loadAgentDefs } from "./agent-defs.js";
+import {
+    loadKnowledgeContext,
+    buildOrchestratorKnowledgeSection,
+    buildWorkerRecordingInstructions,
+    type KnowledgeContext
+} from "./knowledge-bridge.js";
 
 const DEFAULT_CONFIG = {
     maxTeamSize: 6,
@@ -48,6 +54,22 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
         log(`Loaded ${skills.size} skill(s): ${[...skills.keys()].join(", ")}`);
     } catch (err) {
         warn(`Could not load skills: ${err}`);
+    }
+
+    // Knowledge Bridge: connect to auto-code-buddy if present
+    let knowledgeCtx: KnowledgeContext | null = null;
+    let workerRecordingInstructions: string | undefined;
+    const autoBuddySkill = skills.get("auto-code-buddy");
+    if (autoBuddySkill) {
+        try {
+            knowledgeCtx = await loadKnowledgeContext(autoBuddySkill.rootDir);
+            if (knowledgeCtx) {
+                workerRecordingInstructions = buildWorkerRecordingInstructions(knowledgeCtx);
+                log(`Knowledge bridge active: ${knowledgeCtx.categoryContents.size} categories, ${knowledgeCtx.experienceContents.size} experiences loaded from ${autoBuddySkill.rootDir}`);
+            }
+        } catch (err) {
+            warn(`Knowledge bridge failed to initialize: ${err}`);
+        }
     }
 
     // Track the orchestrator's session ID
@@ -340,7 +362,7 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                 }
 
                 const skillContext = buildSkillContext(skills, agent.skills);
-                const fullPrompt = buildDelegationPrompt(agent, args.task, skillContext);
+                const fullPrompt = buildDelegationPrompt(agent, args.task, skillContext, workerRecordingInstructions);
 
                 // Lock to prevent parallel delegations
                 delegationInProgress = true;
@@ -416,12 +438,23 @@ export const AgentTeamPlugin: Plugin = async (ctx) => {
                 skillsSection = `\n\n## Available Skills\n\nAssign these to agents via the \`skills\` field in \`add_agent\` (comma-separated). Skill content is automatically injected into the agent's prompt during delegation.\n\n${skillLines.join("\n")}`;
             }
 
+            // Build knowledge section for orchestrator (from auto-code-buddy)
+            let knowledgeSection = "";
+            if (knowledgeCtx) {
+                knowledgeSection = buildOrchestratorKnowledgeSection(knowledgeCtx);
+            }
+
             // Register agent-team agents (user overrides in opencode.json take precedence)
             for (const [name, def] of Object.entries(agentDefs)) {
                 const merged = { ...def, ...config.agent[name] };
-                // Append skills list to orchestrator prompt
-                if (name === "orchestrator" && skillsSection && merged.prompt) {
-                    merged.prompt = merged.prompt + skillsSection;
+                // Append skills list and knowledge context to orchestrator prompt
+                if (name === "orchestrator" && merged.prompt) {
+                    if (skillsSection) {
+                        merged.prompt = merged.prompt + skillsSection;
+                    }
+                    if (knowledgeSection) {
+                        merged.prompt = merged.prompt + knowledgeSection;
+                    }
                 }
                 config.agent[name] = merged;
             }

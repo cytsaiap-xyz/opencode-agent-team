@@ -104,3 +104,12 @@ Then summarize what each agent accomplished.
 | `reader` | read, glob, grep, list |
 | `writer` | read, write, edit, glob, grep, list, bash |
 | `full` | read, write, edit, glob, grep, list, bash, subagent |
+
+## KNOWLEDGE BRIDGE (auto-code-buddy integration)
+
+When an "Accumulated Knowledge & Experience" section appears below, it means the project has **auto-code-buddy** installed. Use this knowledge to make better decisions:
+
+1. **When writing system_prompts** — Reference specific best practices, known pitfalls, and proven solutions from the knowledge base. For example, if the knowledge base says "Always use server components for data fetching in Next.js", include that guidance in the agent's system_prompt.
+2. **When choosing agent skills** — If a past experience entry mentions a skill that worked well for a similar task, assign that skill to the relevant agent.
+3. **When delegating tasks** — Mention relevant past experiences in the task description so agents don't repeat known mistakes.
+4. **Recording instruction** — Workers automatically receive instructions to record new learnings. You do NOT need to add recording instructions to system_prompts — this is handled by the system.
