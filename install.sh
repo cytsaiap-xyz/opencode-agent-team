@@ -32,11 +32,23 @@ echo "  Using package manager: $PKG_MGR"
 # 1. Create directories
 mkdir -p "$OPENCODE_DIR/plugins"
 
-# 2. Create plugin entry point
-cat > "$OPENCODE_DIR/plugins/agent-team.ts" << 'EOF'
-export { AgentTeamPlugin as default } from "../../agent-team/src/index.ts";
+# 2. Create plugin entry point (resolve correct path to this repo's source)
+PLUGIN_SRC="$SCRIPT_DIR/src/index.ts"
+
+# Compute relative path from .opencode/plugins/ to the repo source
+PLUGINS_DIR="$(cd "$OPENCODE_DIR/plugins" && pwd)"
+REL_PATH="$(python3 -c "import os.path; print(os.path.relpath('$PLUGIN_SRC', '$PLUGINS_DIR'))" 2>/dev/null || \
+           node -e "const p=require('path'); console.log(p.relative('$PLUGINS_DIR','$PLUGIN_SRC'))" 2>/dev/null)"
+
+if [ -z "$REL_PATH" ]; then
+  echo "ERROR: Could not compute relative path. Ensure python3 or node is available."
+  exit 1
+fi
+
+cat > "$OPENCODE_DIR/plugins/agent-team.ts" << EOF
+export { AgentTeamPlugin as default } from "${REL_PATH}";
 EOF
-echo "  Created .opencode/plugins/agent-team.ts"
+echo "  Created .opencode/plugins/agent-team.ts (-> ${REL_PATH})"
 
 # 3. Create agent-team.json toggle config (if it doesn't already exist)
 if [ ! -f "$OPENCODE_DIR/agent-team.json" ]; then
