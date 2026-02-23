@@ -12,16 +12,43 @@ PROJECT_DIR="${1:-.}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OPENCODE_DIR="$PROJECT_DIR/.opencode"
 
+# Detect package manager: prefer bun, fall back to npm
+if command -v bun &> /dev/null; then
+  PKG_MGR="bun"
+  PKG_INSTALL="bun install --silent"
+  PKG_ADD="bun add"
+elif command -v npm &> /dev/null; then
+  PKG_MGR="npm"
+  PKG_INSTALL="npm install --silent"
+  PKG_ADD="npm install"
+else
+  echo "ERROR: Neither bun nor npm found. Please install one of them first."
+  exit 1
+fi
+
 echo "Installing agent-team plugin into: $PROJECT_DIR"
+echo "  Using package manager: $PKG_MGR"
 
 # 1. Create directories
 mkdir -p "$OPENCODE_DIR/plugins"
 
-# 2. Create plugin entry point
-cat > "$OPENCODE_DIR/plugins/agent-team.ts" << 'EOF'
-export { AgentTeamPlugin as default } from "../../agent-team/src/index.ts";
+# 2. Create plugin entry point (resolve correct path to this repo's source)
+PLUGIN_SRC="$SCRIPT_DIR/src/index.ts"
+
+# Compute relative path from .opencode/plugins/ to the repo source
+PLUGINS_DIR="$(cd "$OPENCODE_DIR/plugins" && pwd)"
+REL_PATH="$(python3 -c "import os.path; print(os.path.relpath('$PLUGIN_SRC', '$PLUGINS_DIR'))" 2>/dev/null || \
+           node -e "const p=require('path'); console.log(p.relative('$PLUGINS_DIR','$PLUGIN_SRC'))" 2>/dev/null)"
+
+if [ -z "$REL_PATH" ]; then
+  echo "ERROR: Could not compute relative path. Ensure python3 or node is available."
+  exit 1
+fi
+
+cat > "$OPENCODE_DIR/plugins/agent-team.ts" << EOF
+export { AgentTeamPlugin as default } from "${REL_PATH}";
 EOF
-echo "  Created .opencode/plugins/agent-team.ts"
+echo "  Created .opencode/plugins/agent-team.ts (-> ${REL_PATH})"
 
 # 3. Create agent-team.json toggle config (if it doesn't already exist)
 if [ ! -f "$OPENCODE_DIR/agent-team.json" ]; then
@@ -39,7 +66,7 @@ fi
 # 4. Set up .opencode/package.json (merge if exists)
 if [ -f "$OPENCODE_DIR/package.json" ]; then
   if ! grep -q '@opencode-ai/plugin' "$OPENCODE_DIR/package.json"; then
-    cd "$OPENCODE_DIR" && bun add @opencode-ai/plugin && cd - > /dev/null
+    cd "$OPENCODE_DIR" && $PKG_ADD @opencode-ai/plugin && cd - > /dev/null
     echo "  Added @opencode-ai/plugin to .opencode/package.json"
   else
     echo "  .opencode/package.json already has @opencode-ai/plugin"
@@ -57,8 +84,16 @@ fi
 
 # 5. Install dependencies
 echo "  Installing dependencies..."
-cd "$OPENCODE_DIR" && bun install --silent && cd - > /dev/null
-cd "$SCRIPT_DIR" && bun install --silent && cd - > /dev/null
+cd "$OPENCODE_DIR" && $PKG_INSTALL && cd - > /dev/null
+cd "$SCRIPT_DIR" && $PKG_INSTALL && cd - > /dev/null
+
+# 6. Verify critical dependency is installed
+if [ ! -d "$SCRIPT_DIR/node_modules/@opencode-ai/plugin" ]; then
+  echo ""
+  echo "WARNING: @opencode-ai/plugin was not installed in $SCRIPT_DIR."
+  echo "  Try running '$PKG_INSTALL' manually inside: $SCRIPT_DIR"
+  exit 1
+fi
 
 echo ""
 echo "Done! Restart OpenCode to activate the agent-team plugin."
