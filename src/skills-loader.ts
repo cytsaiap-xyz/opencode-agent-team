@@ -11,6 +11,8 @@ export interface SkillDefinition {
     description: string;
     content: string;
     source: "project" | "global";
+    /** Absolute path to the skill's root directory (parent of SKILL.md) */
+    rootDir: string;
 }
 
 export type SkillsRegistry = Map<string, SkillDefinition>;
@@ -47,7 +49,8 @@ async function loadSkillsFromDir(
     }
 
     for (const dirName of entries) {
-        const skillPath = join(skillsDir, dirName, "SKILL.md");
+        const skillDir = join(skillsDir, dirName);
+        const skillPath = join(skillDir, "SKILL.md");
         let raw: string;
         try {
             raw = await readFile(skillPath, "utf-8");
@@ -61,7 +64,8 @@ async function loadSkillsFromDir(
                 name: parsed.name,
                 description: parsed.description,
                 content: parsed.content,
-                source
+                source,
+                rootDir: skillDir
             });
         } catch {
             // Failed to parse skill — skip silently

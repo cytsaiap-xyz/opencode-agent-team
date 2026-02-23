@@ -32,12 +32,14 @@ export function resolvePermissions(
 
 /**
  * Build the full delegation prompt sent via SubtaskPartInput.
- * Includes agent identity, skill context (if any), and the task.
+ * Includes agent identity, skill context (if any), knowledge recording
+ * instructions (if auto-code-buddy is present), and the task.
  */
 export function buildDelegationPrompt(
     agent: AgentSpec,
     task: string,
-    skillContext: string
+    skillContext: string,
+    knowledgeRecordingInstructions?: string
 ): string {
     const parts: string[] = [
         `# Your Role: ${agent.name}`,
@@ -47,6 +49,10 @@ export function buildDelegationPrompt(
 
     if (skillContext) {
         parts.push("", skillContext);
+    }
+
+    if (knowledgeRecordingInstructions) {
+        parts.push("", knowledgeRecordingInstructions);
     }
 
     parts.push("", "# Task", "", task);
