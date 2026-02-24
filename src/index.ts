@@ -29,8 +29,12 @@ const BUILTIN_AGENTS = ["plan", "build", "general", "explore"] as const;
 export const AgentTeamPlugin: Plugin = async (ctx) => {
     const { directory, client } = ctx;
 
-    // Load toggle config and agent definitions
+    // Load toggle config — bail out entirely when disabled
     const pluginConfig = loadAgentTeamConfig(directory);
+    if (!pluginConfig.enabled) {
+        return {};
+    }
+
     const agentDefs = loadAgentDefs(PLUGIN_DIR);
 
     const log = (...args: unknown[]) => { if (pluginConfig.verbose) console.log("[agent-team]", ...args); };
