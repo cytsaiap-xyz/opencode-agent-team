@@ -12,7 +12,8 @@ export interface AgentTeamConfig {
 
 /**
  * Load the agent-team config from the project's .opencode/agent-team.json.
- * Returns { enabled: true, verbose: false } by default if the file doesn't exist.
+ * Returns { enabled: false, verbose: false } by default if the file doesn't exist.
+ * Projects must explicitly opt in with { "enabled": true }.
  */
 export function loadAgentTeamConfig(projectDir: string): AgentTeamConfig {
     const configPath = join(projectDir, ".opencode", "agent-team.json");
@@ -22,10 +23,10 @@ export function loadAgentTeamConfig(projectDir: string): AgentTeamConfig {
         const parsed = JSON.parse(raw);
 
         return {
-            enabled: parsed.enabled !== false,
+            enabled: parsed.enabled === true,
             verbose: parsed.verbose === true
         };
     } catch {
-        return { enabled: true, verbose: false };
+        return { enabled: false, verbose: false };
     }
 }
